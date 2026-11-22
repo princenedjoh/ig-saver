@@ -2,6 +2,8 @@
 
 A small Chrome extension that adds a download button to Instagram posts, reels and stories. Photos save as **JPG**, videos as **MP4**, straight into your Downloads folder.
 
+![IG Saver demo](docs/demo.gif)
+
 ## Features
 
 - A button on every post and reel in the feed, on Explore and in the post pop-ups (including posts opened from Messages)
