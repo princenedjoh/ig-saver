@@ -118,20 +118,54 @@ async function storyTarget() {
   throw new Error('Could not identify this story');
 }
 
+// The carousel's dots: a row of tiny empty siblings, one per slide, where the
+// active one is more opaque. They sit many levels away from the slide in the DOM,
+// so find them by position instead: over or just under the slide on screen, with
+// exactly one dot per slide so a stray group of small elements can't match.
+function slideFromDots(el, count) {
+  const frame = visibleRect(el);
+  const rows = new Set();
+  for (const dot of document.querySelectorAll('div:empty, span:empty')) {
+    const r = dot.getBoundingClientRect();
+    if (r.width === 0 || r.width > 12 || r.height === 0 || r.height > 12) continue;
+    if (r.left < frame.left || r.right > frame.right || r.top < frame.top || r.top > frame.bottom + 60) continue;
+    rows.add(dot.parentElement);
+  }
+  for (const row of rows) {
+    const dots = [...row.children];
+    if (dots.length !== count || dots.some((d) => d.children.length || d.getBoundingClientRect().width > 12)) continue;
+    // The active dot carries an extra class the moment the slide changes; its
+    // opacity only catches up after a short transition, so check the class first.
+    const odd = dots.filter((d) => dots.filter((o) => o.className === d.className).length === 1);
+    if (odd.length === 1) return dots.indexOf(odd[0]);
+    const opacities = dots.map((d) => Number(getComputedStyle(d).opacity));
+    const max = Math.max(...opacities);
+    if (opacities.filter((o) => o === max).length === 1) return opacities.indexOf(max);
+  }
+  return -1;
+}
+
 // Index of the carousel slide on screen, or -1 if we can't tell
-function currentSlide(root, media) {
+function currentSlide(root, media, shortcode) {
   const el = visibleMedia(root)?.el;
   if (!el) return -1;
 
+  // Images (and videos with a poster) name their file, which the API lists per slide.
+  // Carousel videos play from a blob: URL with no poster, so they need the fallbacks.
   const sources = [el.currentSrc, el.src, el.poster].filter((u) => u && !u.startsWith('blob:'));
   for (const src of sources) {
     const index = media.findIndex((m) => m.keys.includes(fileKey(src)));
     if (index !== -1) return index;
   }
 
-  // Fall back to position, but only when every slide is rendered as a list item
-  const slides = [...root.querySelectorAll('ul li')].filter((li) => li.querySelector('img, video'));
-  if (slides.length === media.length) return slides.indexOf(el.closest('li'));
+  const fromDots = slideFromDots(el, media.length);
+  if (fromDots !== -1) return fromDots;
+
+  // An open post keeps ?img_index=<1-based slide> in the URL once you've moved off the first slide
+  if (location.pathname.match(SHORTCODE_RE)?.[1] === shortcode) {
+    const n = Number(new URLSearchParams(location.search).get('img_index') ?? 1);
+    if (n >= 1 && n <= media.length) return n - 1;
+  }
   return -1;
 }
 
@@ -143,7 +177,7 @@ async function download(root, button) {
     if (!shortcode) throw new Error('Could not identify this post');
 
     const media = await fetchMedia(story ? story.id : shortcodeToId(shortcode));
-    const slide = media.length > 1 ? currentSlide(root, media) : 0;
+    const slide = media.length > 1 ? currentSlide(root, media, shortcode) : 0;
     if (slide === -1) throw new Error('Could not tell which slide is showing');
 
     const m = media[slide];
@@ -192,7 +226,30 @@ function createButton(root) {
   return button;
 }
 
-// The visible media inside a root ({ el, rect }): largest on-screen <img>/<video>
+// The part of an element you can actually see: its box cut down by the viewport
+// and by every ancestor that clips. A carousel lays its neighbouring slides out
+// beside the current one and hides them with overflow, so the viewport alone
+// would count them as fully visible.
+function visibleRect(el) {
+  const r = el.getBoundingClientRect();
+  let left = Math.max(r.left, 0);
+  let top = Math.max(r.top, 0);
+  let right = Math.min(r.right, innerWidth);
+  let bottom = Math.min(r.bottom, innerHeight);
+  for (let node = el.parentElement; node && node !== document.body; node = node.parentElement) {
+    if (right <= left || bottom <= top) break;
+    const style = getComputedStyle(node);
+    if (style.overflowX === 'visible' && style.overflowY === 'visible') continue;
+    const c = node.getBoundingClientRect();
+    left = Math.max(left, c.left);
+    top = Math.max(top, c.top);
+    right = Math.min(right, c.right);
+    bottom = Math.min(bottom, c.bottom);
+  }
+  return { left, top, right, bottom, width: Math.max(right - left, 0), height: Math.max(bottom - top, 0) };
+}
+
+// The visible media inside a root ({ el, rect }): the <img>/<video> with the most on screen
 function visibleMedia(root) {
   const candidates = root.matches('img, video') ? [root] : root.querySelectorAll('img, video');
   let best = null;
@@ -200,11 +257,10 @@ function visibleMedia(root) {
   for (const el of candidates) {
     const r = el.getBoundingClientRect();
     if (r.width < MIN_MEDIA_SIZE || r.height < MIN_MEDIA_SIZE) continue;
-    const w = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
-    const h = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
-    const area = Math.max(w, 0) * Math.max(h, 0);
+    const rect = visibleRect(el);
+    const area = rect.width * rect.height;
     if (area > bestArea) {
-      best = { el, rect: r };
+      best = { el, rect };
       bestArea = area;
     }
   }
@@ -257,6 +313,14 @@ function scan() {
   if (inStories) {
     for (const img of document.querySelectorAll('img')) {
       if (isStorySized(img)) roots.add(img); // story photo, not avatars
+    }
+  } else if (SHORTCODE_RE.test(location.pathname)) {
+    // An open post (its own page or the overlay) isn't wrapped in an <article>, so
+    // its photos need roots of their own. Skip the "more posts" tiles, which are links.
+    for (const img of document.querySelectorAll('img')) {
+      if (img.closest('article, a[href]')) continue;
+      const r = img.getBoundingClientRect();
+      if (r.width >= MIN_MEDIA_SIZE && r.height >= MIN_MEDIA_SIZE) roots.add(img);
     }
   }
   for (const root of roots) {
